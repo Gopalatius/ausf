@@ -227,7 +227,7 @@ func UeAuthPostRequestProcedure(updateAuthenticationInfo models.AuthenticationIn
 			ausfUeContext.XresStar = authInfoResult.AuthenticationVector.XresStar
 			ausfUeContext.Kausf = authInfoResult.AuthenticationVector.Kausf
 			ausfUeContext.Rand = authInfoResult.AuthenticationVector.Rand
-			
+			// teep
 
 			av5gAka.Rand = authInfoResult.AuthenticationVector.Rand
 			av5gAka.Autn = authInfoResult.AuthenticationVector.Autn
