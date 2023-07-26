@@ -36,6 +36,8 @@ type AusfUeContext struct {
 
 	// for 5G AKA
 	XresStar string
+	HxresStar string
+	Autn string
 
 	// for EAP-AKA'
 	K_aut    string

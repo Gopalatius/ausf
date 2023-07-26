@@ -3,7 +3,7 @@ package producer
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
+	// "crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"math/rand"
@@ -20,6 +20,8 @@ import (
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/util/httpwrapper"
 	"github.com/free5gc/util/ueauth"
+
+	"github.com/minio/sha256-simd"
 )
 
 func HandleEapAuthComfirmRequest(request *httpwrapper.Request) *httpwrapper.Response {
@@ -141,66 +143,113 @@ func UeAuthPostRequestProcedure(updateAuthenticationInfo models.AuthenticationIn
 	}()
 
 	ueid := authInfoResult.Supi
-	ausfUeContext := ausf_context.NewAusfUeContext(ueid)
-	ausfUeContext.ServingNetworkName = snName
-	ausfUeContext.AuthStatus = models.AuthResult_ONGOING
-	ausfUeContext.UdmUeauUrl = udmUrl
-	ausf_context.AddAusfUeContextToPool(ausfUeContext)
+	
+	
 
-	logger.UeAuthPostLog.Infof("Add SuciSupiPair (%s, %s) to map.\n", supiOrSuci, ueid)
-	ausf_context.AddSuciSupiPairToMap(supiOrSuci, ueid)
+	
 
 	locationURI := self.Url + "/nausf-auth/v1/ue-authentications/" + supiOrSuci
 	putLink := locationURI
 	if authInfoResult.AuthType == models.AuthType__5_G_AKA {
 		logger.UeAuthPostLog.Infoln("Use 5G AKA auth method")
 		putLink += "/5g-aka-confirmation"
-
-		// Derive HXRES* from XRES*
-		concat := authInfoResult.AuthenticationVector.Rand + authInfoResult.AuthenticationVector.XresStar
-		var hxresStarBytes []byte
-		if bytes, err := hex.DecodeString(concat); err != nil {
-			logger.Auth5gAkaComfirmLog.Errorf("decode concat error: %+v", err)
-			// TODO: return ProblemDetails
-		} else {
-			hxresStarBytes = bytes
-		}
-		hxresStarAll := sha256.Sum256(hxresStarBytes)
-		hxresStar := hex.EncodeToString(hxresStarAll[16:]) // last 128 bits
-		logger.Auth5gAkaComfirmLog.Infof("XresStar = %x\n", authInfoResult.AuthenticationVector.XresStar)
-
-		// Derive Kseaf from Kausf
-		Kausf := authInfoResult.AuthenticationVector.Kausf
-		var KausfDecode []byte
-		if ausfDecode, err := hex.DecodeString(Kausf); err != nil {
-			logger.Auth5gAkaComfirmLog.Errorf("decode Kausf failed: %+v", err)
-			// TODO: return ProblemDetails
-		} else {
-			KausfDecode = ausfDecode
-		}
-		P0 := []byte(snName)
-		Kseaf, err := ueauth.GetKDFValue(KausfDecode, ueauth.FC_FOR_KSEAF_DERIVATION, P0, ueauth.KDFLen(P0))
-		if err != nil {
-			logger.Auth5gAkaComfirmLog.Errorf("GetKDFValue failed: %+v", err)
-			// TODO: return ProblemDetails
-		}
-		ausfUeContext.XresStar = authInfoResult.AuthenticationVector.XresStar
-		ausfUeContext.Kausf = Kausf
-		ausfUeContext.Kseaf = hex.EncodeToString(Kseaf)
-		ausfUeContext.Rand = authInfoResult.AuthenticationVector.Rand
-
 		var av5gAka models.Av5gAka
-		av5gAka.Rand = authInfoResult.AuthenticationVector.Rand
-		av5gAka.Autn = authInfoResult.AuthenticationVector.Autn
-		av5gAka.HxresStar = hxresStar
+		if (ausf_context.CheckIfAusfUeContextExists(authInfoResult.Supi)){
+			start := time.Now()
+			recentAusfUeContext := ausf_context.GetAusfUeContext(ueid)
+			av5gAka.HxresStar = recentAusfUeContext.HxresStar
+			av5gAka.Rand = recentAusfUeContext.Rand
+			av5gAka.Autn = recentAusfUeContext.Autn
+			elapsed := time.Since(start).Nanoseconds()
+			logger.UeAuthPostLog.Printf("Cached UE. Skipping derivation. Caching only took %+v nanoseconds", elapsed)
+		}else{
+			// TEEP
+			
+			// Create two channels for results using parallelism
+			logger.UeAuthPostLog.Info("UE is not cached. Redoing the full authentication in AUSF")
+			start := time.Now()
+
+			ausfUeContext := ausf_context.NewAusfUeContext(ueid)
+			ausfUeContext.ServingNetworkName = snName
+			ausfUeContext.AuthStatus = models.AuthResult_ONGOING
+			ausfUeContext.UdmUeauUrl = udmUrl
+			
+			hxresStarCh := make(chan string)
+			defer close(hxresStarCh)
+			kseafCh := make(chan string)
+			defer close(kseafCh)
+
+			// Derive HXRES* in a separate goroutine
+			go func() {
+				randBytes, err := hex.DecodeString(authInfoResult.AuthenticationVector.Rand)
+				if err != nil {
+					logger.Auth5gAkaComfirmLog.Errorf("decode rand error: %+v", err)
+					// TODO: return ProblemDetails
+				}
+				xresStarBytes, err := hex.DecodeString(authInfoResult.AuthenticationVector.XresStar)
+				if err != nil {
+					logger.Auth5gAkaComfirmLog.Errorf("decode xresStar error: %+v", err)
+					// TODO: return ProblemDetails
+				}
+				hxresStarBytes := make([]byte, 0, len(randBytes)+len(xresStarBytes))
+				hxresStarBytes = append(hxresStarBytes, randBytes...)
+				hxresStarBytes = append(hxresStarBytes, xresStarBytes...)
+				hxresStarAll := sha256.Sum256(hxresStarBytes)
+				hxresStar := hex.EncodeToString(hxresStarAll[16:]) // last 128 bits
+				
+				hxresStarCh <- hxresStar // send the result to the channel
+			}()
+
+			// Derive Kseaf in a separate goroutine
+			go func() {
+				Kausf := authInfoResult.AuthenticationVector.Kausf
+				KausfDecode, err := hex.DecodeString(Kausf)
+				if err != nil {
+					logger.Auth5gAkaComfirmLog.Errorf("decode Kausf failed: %+v", err)
+					// TODO: return ProblemDetails
+				}
+				P0 := []byte(snName)
+				Kseaf, err := ueauth.GetKDFValue(KausfDecode, ueauth.FC_FOR_KSEAF_DERIVATION, P0, ueauth.KDFLen(P0))
+				if err != nil {
+					logger.Auth5gAkaComfirmLog.Errorf("GetKDFValue failed: %+v", err)
+					// TODO: return ProblemDetails
+				}
+				kseafCh <- hex.EncodeToString(Kseaf) // send the result to the channel
+			}()
+
+			// Wait for both results and assign them to ausfUeContext fields
+			
+			av5gAka.HxresStar = <-hxresStarCh // receive the result from the channel
+			ausfUeContext.Kseaf = <-kseafCh // receive the result from the channel
+
+			ausfUeContext.Autn = authInfoResult.AuthenticationVector.Autn
+			ausfUeContext.HxresStar = av5gAka.HxresStar
+			ausfUeContext.XresStar = authInfoResult.AuthenticationVector.XresStar
+			ausfUeContext.Kausf = authInfoResult.AuthenticationVector.Kausf
+			ausfUeContext.Rand = authInfoResult.AuthenticationVector.Rand
+			
+
+			av5gAka.Rand = authInfoResult.AuthenticationVector.Rand
+			av5gAka.Autn = authInfoResult.AuthenticationVector.Autn
+			ausf_context.AddAusfUeContextToPool(ausfUeContext)
+			elapsed := time.Since(start).Nanoseconds()
+			logger.Auth5gAkaComfirmLog.Infof("XresStar = %x\n", authInfoResult.AuthenticationVector.XresStar)
+
+			logger.UeAuthPostLog.Printf("Cache not found. Deriving HXRES* and Kseaf in %+v nanoseconds", elapsed)
+		}
 		responseBody.Var5gAuthData = av5gAka
 
+		
 		linksValue := models.LinksValueSchema{Href: putLink}
 		responseBody.Links = make(map[string]models.LinksValueSchema)
 		responseBody.Links["5g-aka"] = linksValue
 	} else if authInfoResult.AuthType == models.AuthType_EAP_AKA_PRIME {
 		logger.UeAuthPostLog.Infoln("Use EAP-AKA' auth method")
 		putLink += "/eap-session"
+		ausfUeContext := ausf_context.NewAusfUeContext(ueid)
+		ausfUeContext.ServingNetworkName = snName
+		ausfUeContext.AuthStatus = models.AuthResult_ONGOING
+		ausfUeContext.UdmUeauUrl = udmUrl
 
 		var identity string
 		// TODO support more SUPI type
@@ -295,6 +344,8 @@ func UeAuthPostRequestProcedure(updateAuthenticationInfo models.AuthenticationIn
 	}
 
 	responseBody.AuthType = authInfoResult.AuthType
+	logger.UeAuthPostLog.Infof("Add SuciSupiPair (%s, %s) to map.\n", supiOrSuci, ueid)
+	ausf_context.AddSuciSupiPairToMap(supiOrSuci, ueid)
 
 	return &responseBody, locationURI, nil
 }

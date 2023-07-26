@@ -12,6 +12,7 @@ require (
 	github.com/gin-gonic/gin v1.7.3
 	github.com/google/gopacket v1.1.19
 	github.com/google/uuid v1.3.0
+	github.com/minio/sha256-simd v1.0.1 // indirect
 	github.com/sirupsen/logrus v1.8.1
 	github.com/stretchr/testify v1.7.0
 	github.com/urfave/cli v1.22.5
